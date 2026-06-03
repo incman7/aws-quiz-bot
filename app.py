@@ -276,7 +276,10 @@ def trigger_daily():
     Called by Vercel built-in cron (GET) or external cron like cron-job.org (POST).
     Optionally protected by a secret header (bypassed for Vercel's own cron).
     """
-    is_vercel_cron = request.headers.get("x-vercel-cron") == "1"
+    is_vercel_cron = (
+        request.headers.get("x-vercel-cron") == "1"
+        or "vercel-cron" in request.headers.get("User-Agent", "").lower()
+    )
     if CRON_SECRET and not is_vercel_cron:
         auth = request.headers.get("X-Cron-Secret", "")
         if auth != CRON_SECRET:
