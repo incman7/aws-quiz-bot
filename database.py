@@ -95,13 +95,19 @@ def get_user_state(psid: str) -> dict:
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT * FROM user_state WHERE psid = {PLACEHOLDER}",
+            f"SELECT psid, current_q, state, last_active FROM user_state WHERE psid = {PLACEHOLDER}",
             (psid,),
         )
         row = cur.fetchone()
-    if row is None:
-        return {"psid": psid, "current_q": None, "state": "idle", "last_active": None}
-    return dict(row)
+        if row is None:
+            return {"psid": psid, "current_q": None, "state": "idle", "last_active": None}
+        if DATABASE_URL:
+            # psycopg2 returns tuples — zip with column names
+            cols = [desc[0] for desc in cur.description]
+            return dict(zip(cols, row))
+        else:
+            # sqlite3 with row_factory returns sqlite3.Row — dict() works
+            return dict(row)
 
 
 def upsert_user_state(psid: str, current_q: int = None, state: str = None):
