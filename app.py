@@ -283,7 +283,12 @@ def trigger_daily():
             abort(401)
 
     result = _send_daily_question_to_all_users()
-    return jsonify({"status": "ok", "message": "Daily questions sent.", "debug": result})
+    return jsonify({
+        "status": "ok",
+        "message": "Daily questions sent.",
+        "debug": result,
+        "database_url_set": bool(db.DATABASE_URL),
+    })
 
 
 @app.route("/api/status", methods=["GET"])
