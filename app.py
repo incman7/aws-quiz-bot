@@ -55,35 +55,32 @@ def _pick_next_question(psid: str):
 def _send_daily_question_to_all_users():
     """
     Send the daily question to every known user.
-    In practice you only have one PSID stored, but this scales.
+    Returns a dict with results for logging.
     """
-    import sqlite3, os
-
     # Gather all PSIDs from the DB
     psids = []
+    db_error = None
     try:
-        if db.DATABASE_URL:
-            import psycopg2
-            conn = psycopg2.connect(db.DATABASE_URL, sslmode="require")
+        with db._get_conn() as conn:
             cur = conn.cursor()
             cur.execute("SELECT psid FROM user_state")
             psids = [row[0] for row in cur.fetchall()]
-            conn.close()
-        else:
-            conn = sqlite3.connect(db.DB_PATH)
-            cur = conn.cursor()
-            cur.execute("SELECT psid FROM user_state")
-            psids = [row[0] for row in cur.fetchall()]
-            conn.close()
     except Exception as e:
+        db_error = str(e)
         print(f"[scheduler] DB error: {e}")
-        return
+        return {"psids_found": 0, "db_error": db_error}
 
+    print(f"[scheduler] Found {len(psids)} user(s): {psids}")
+    errors = []
     for psid in psids:
         try:
             _send_daily_question(psid)
+            print(f"[scheduler] Sent question to {psid}")
         except Exception as e:
             print(f"[scheduler] Error sending to {psid}: {e}")
+            errors.append({"psid": psid, "error": str(e)})
+
+    return {"psids_found": len(psids), "errors": errors}
 
 
 def _send_daily_question(psid: str):
@@ -285,8 +282,8 @@ def trigger_daily():
         if auth != CRON_SECRET:
             abort(401)
 
-    _send_daily_question_to_all_users()
-    return jsonify({"status": "ok", "message": "Daily questions sent."})
+    result = _send_daily_question_to_all_users()
+    return jsonify({"status": "ok", "message": "Daily questions sent.", "debug": result})
 
 
 @app.route("/api/status", methods=["GET"])
