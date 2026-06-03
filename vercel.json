@@ -10,5 +10,11 @@
       "src": "/(.*)",
       "dest": "app.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/send-daily",
+      "schedule": "0 1 * * *"
+    }
   ]
 }
