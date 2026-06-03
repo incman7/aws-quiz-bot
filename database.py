@@ -104,30 +104,57 @@ def get_user_state(psid: str) -> dict:
     return dict(row)
 
 
-def upsert_user_state(psid: str, current_q: int = None, state: str = "idle"):
+def upsert_user_state(psid: str, current_q: int = None, state: str = None):
+    """
+    Insert or update user state.
+    If called with only psid (registration), existing current_q/state are preserved.
+    If called with explicit state/current_q, those values are updated.
+    """
     now = datetime.utcnow().isoformat()
     with _get_conn() as conn:
         cur = conn.cursor()
         if DATABASE_URL:
-            cur.execute(
-                f"""
-                INSERT INTO user_state (psid, current_q, state, last_active)
-                VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})
-                ON CONFLICT (psid) DO UPDATE SET
-                    current_q = EXCLUDED.current_q,
-                    state = EXCLUDED.state,
-                    last_active = EXCLUDED.last_active
-                """,
-                (psid, current_q, state, now),
-            )
+            if state is not None:
+                # Full upsert — update all fields
+                cur.execute(
+                    f"""
+                    INSERT INTO user_state (psid, current_q, state, last_active)
+                    VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})
+                    ON CONFLICT (psid) DO UPDATE SET
+                        current_q = EXCLUDED.current_q,
+                        state = EXCLUDED.state,
+                        last_active = EXCLUDED.last_active
+                    """,
+                    (psid, current_q, state, now),
+                )
+            else:
+                # Registration only — insert if not exists, just update last_active if exists
+                cur.execute(
+                    f"""
+                    INSERT INTO user_state (psid, current_q, state, last_active)
+                    VALUES ({PLACEHOLDER}, NULL, 'idle', {PLACEHOLDER})
+                    ON CONFLICT (psid) DO UPDATE SET
+                        last_active = EXCLUDED.last_active
+                    """,
+                    (psid, now),
+                )
         else:
-            cur.execute(
-                f"""
-                INSERT OR REPLACE INTO user_state (psid, current_q, state, last_active)
-                VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})
-                """,
-                (psid, current_q, state, now),
-            )
+            if state is not None:
+                cur.execute(
+                    f"""
+                    INSERT OR REPLACE INTO user_state (psid, current_q, state, last_active)
+                    VALUES ({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})
+                    """,
+                    (psid, current_q, state, now),
+                )
+            else:
+                cur.execute(
+                    f"""
+                    INSERT OR IGNORE INTO user_state (psid, current_q, state, last_active)
+                    VALUES ({PLACEHOLDER}, NULL, 'idle', {PLACEHOLDER})
+                    """,
+                    (psid, now),
+                )
 
 
 # ── Quiz history ──────────────────────────────────────────────────────────────

@@ -177,6 +177,10 @@ def _handle_message(psid: str, message_text: str):
     text_lower = text.lower()
     log.info("[message] psid=%s text='%s'", psid, text[:80])
 
+    # Always ensure user is registered so the cron job can find them
+    db.upsert_user_state(psid)
+    log.info("[message] psid=%s ensured in user_state", psid)
+
     if text_lower in ("stats", "score", "how am i doing"):
         stats = db.get_stats(psid)
         log.info("[message] psid=%s stats: %s", psid, stats)
