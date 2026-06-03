@@ -270,13 +270,14 @@ def receive_message():
     return "ok", 200
 
 
-@app.route("/api/send-daily", methods=["POST"])
+@app.route("/api/send-daily", methods=["GET", "POST"])
 def trigger_daily():
     """
-    Called by an external cron job (e.g. cron-job.org) at 9am AWST.
-    Optionally protected by a secret header.
+    Called by Vercel built-in cron (GET) or external cron like cron-job.org (POST).
+    Optionally protected by a secret header (bypassed for Vercel's own cron).
     """
-    if CRON_SECRET:
+    is_vercel_cron = request.headers.get("x-vercel-cron") == "1"
+    if CRON_SECRET and not is_vercel_cron:
         auth = request.headers.get("X-Cron-Secret", "")
         if auth != CRON_SECRET:
             abort(401)
