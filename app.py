@@ -62,7 +62,8 @@ def _pick_next_question(psid: str):
     """Pick a question the user hasn't answered yet (random order)."""
     questions = load_questions()
     answered = db.get_answered_questions(psid)
-    remaining = [q for q in questions if q.number not in answered]
+    # Only include well-formed questions (at least 2 options)
+    remaining = [q for q in questions if q.number not in answered and len(q.options) >= 2]
     log.info("[pick_question] psid=%s total=%d answered=%d remaining=%d",
              psid, len(questions), len(answered), len(remaining))
     if not remaining:
@@ -117,6 +118,7 @@ def _send_daily_question(psid: str):
         return
 
     log.info("[send_question] psid=%s sending question=%d", psid, q.number)
+    llm.clear_history(psid)  # Clear any previous question's conversation
     db.upsert_user_state(psid, current_q=q.number, state="awaiting_answer")
 
     question_msg = format_question_message(q)
@@ -151,6 +153,14 @@ def _handle_answer(psid: str, user_text: str, current_q_num: int):
     result_msg = format_result_message(q, answer_letter)
     msg.send_message(psid, result_msg)
 
+    # Seed LLM conversation history so follow-ups have full question context
+    llm.start_question_context(
+        psid=psid,
+        question_text=q.text,
+        correct_answer=q.correct_answer or "",
+        explanation=q.explanation or "",
+    )
+
 
 def _handle_followup(psid: str, user_text: str, q=None):
     """Answer a follow-up question using the LLM."""
@@ -158,14 +168,9 @@ def _handle_followup(psid: str, user_text: str, q=None):
     msg.send_typing_on(psid)
 
     if q:
-        answer = llm.answer_followup(
-            question_text=q.text,
-            correct_answer=q.correct_answer,
-            explanation=q.explanation,
-            user_followup=user_text,
-        )
+        answer = llm.answer_followup(psid=psid, user_followup=user_text)
     else:
-        answer = llm.answer_general(user_text)
+        answer = llm.answer_general(psid=psid, user_message=user_text)
 
     log.info("[followup] psid=%s LLM response length=%d", psid, len(answer))
     msg.send_message(psid, answer)

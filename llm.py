@@ -2,6 +2,9 @@
 llm.py
 Uses the Groq API (free tier) with Llama 3.3 70B to answer
 follow-up questions about AWS SAA topics.
+
+Maintains per-user conversation history so multi-turn follow-up
+questions work correctly within a question session.
 """
 
 import os
@@ -22,72 +25,92 @@ When answering follow-up questions:
 - Do NOT re-ask the question or repeat the user's words unnecessarily
 """
 
+# Per-user conversation history: {psid: [{"role": ..., "content": ...}, ...]}
+_conversation_history: dict[str, list] = {}
 
-def answer_followup(
+
+def start_question_context(
+    psid: str,
     question_text: str,
     correct_answer: str,
     explanation: str,
-    user_followup: str,
-) -> str:
+) -> None:
     """
-    Given the context of the current quiz question and the user's follow-up,
-    return a concise LLM-generated answer.
+    Called when a question result is sent. Seeds the conversation history
+    for this user with the quiz context so follow-ups have full background.
+    """
+    context = (
+        f"Quiz question context (for follow-up reference):\n"
+        f"Question: {question_text}\n"
+        f"Correct answer: {correct_answer}\n"
+        f"Explanation: {explanation if explanation else '(none available)'}"
+    )
+    _conversation_history[psid] = [
+        {"role": "user", "content": context},
+        {"role": "assistant", "content": "Got it. I'm ready to answer any follow-up questions about this question."},
+    ]
+
+
+def clear_history(psid: str) -> None:
+    """Clear a user's conversation history (e.g. when a new question starts)."""
+    _conversation_history.pop(psid, None)
+
+
+def answer_followup(psid: str, user_followup: str) -> str:
+    """
+    Continue the multi-turn conversation for this user's current question.
+    History is maintained between calls so follow-up questions have context.
     """
     if not GROQ_API_KEY:
-        return (
-            "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
-        )
+        return "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
 
     client = Groq(api_key=GROQ_API_KEY)
 
-    context = f"""
-CURRENT QUIZ QUESTION:
-{question_text}
+    history = _conversation_history.get(psid, [])
+    history.append({"role": "user", "content": user_followup})
 
-CORRECT ANSWER: {correct_answer}
-
-EXPLANATION FROM STUDY MATERIAL:
-{explanation if explanation else '(No explanation available)'}
-
-STUDENT'S FOLLOW-UP QUESTION:
-{user_followup}
-""".strip()
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
 
     try:
         chat = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": context},
-            ],
+            messages=messages,
             max_tokens=400,
             temperature=0.4,
         )
-        return chat.choices[0].message.content.strip()
+        reply = chat.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": reply})
+        _conversation_history[psid] = history
+        return reply
     except Exception as e:
         return f"⚠️ LLM error: {str(e)}"
 
 
-def answer_general(user_message: str) -> str:
+def answer_general(psid: str, user_message: str) -> str:
     """
-    Answer a general AWS question when not in the context of a specific question.
+    Answer a general AWS question (no active question context).
+    Also maintains conversation history for back-and-forth.
     """
     if not GROQ_API_KEY:
-        return (
-            "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
-        )
+        return "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
 
     client = Groq(api_key=GROQ_API_KEY)
+
+    history = _conversation_history.get(psid, [])
+    history.append({"role": "user", "content": user_message})
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
     try:
         chat = client.chat.completions.create(
             model=MODEL,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_message},
-            ],
+            messages=messages,
             max_tokens=400,
             temperature=0.4,
         )
-        return chat.choices[0].message.content.strip()
+        reply = chat.choices[0].message.content.strip()
+        history.append({"role": "assistant", "content": reply})
+        _conversation_history[psid] = history
+        return reply
     except Exception as e:
         return f"⚠️ LLM error: {str(e)}"
