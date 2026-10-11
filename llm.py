@@ -3,12 +3,13 @@ llm.py
 Uses the Groq API (free tier) with Llama 3.3 70B to answer
 follow-up questions about AWS SAA topics.
 
-Maintains per-user conversation history so multi-turn follow-up
-questions work correctly within a question session.
+Conversation history is persisted in the database so multi-turn follow-up
+questions survive serverless cold starts.
 """
 
 import os
 from groq import Groq
+import database as db
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 MODEL = "llama-3.3-70b-versatile"   # fast, free tier, excellent quality
@@ -24,9 +25,6 @@ When answering follow-up questions:
 - If a concept is nuanced, highlight the key exam takeaway
 - Do NOT re-ask the question or repeat the user's words unnecessarily
 """
-
-# Per-user conversation history: {psid: [{"role": ..., "content": ...}, ...]}
-_conversation_history: dict[str, list] = {}
 
 
 def start_question_context(
@@ -45,72 +43,48 @@ def start_question_context(
         f"Correct answer: {correct_answer}\n"
         f"Explanation: {explanation if explanation else '(none available)'}"
     )
-    _conversation_history[psid] = [
+    db.save_llm_history(psid, [
         {"role": "user", "content": context},
         {"role": "assistant", "content": "Got it. I'm ready to answer any follow-up questions about this question."},
-    ]
+    ])
 
 
 def clear_history(psid: str) -> None:
     """Clear a user's conversation history (e.g. when a new question starts)."""
-    _conversation_history.pop(psid, None)
+    db.clear_llm_history(psid)
+
+
+def _chat(psid: str, user_text: str) -> str:
+    """Common LLM call: load history, append turn, send to Groq, persist."""
+    if not GROQ_API_KEY:
+        return "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
+
+    history = db.load_llm_history(psid)
+    history.append({"role": "user", "content": user_text})
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+
+    client = Groq(api_key=GROQ_API_KEY)
+    try:
+        chat = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=400,
+            temperature=0.4,
+        )
+        reply = chat.choices[0].message.content.strip()
+    except Exception as e:
+        return f"⚠️ LLM error: {str(e)}"
+
+    history.append({"role": "assistant", "content": reply})
+    db.save_llm_history(psid, history)
+    return reply
 
 
 def answer_followup(psid: str, user_followup: str) -> str:
-    """
-    Continue the multi-turn conversation for this user's current question.
-    History is maintained between calls so follow-up questions have context.
-    """
-    if not GROQ_API_KEY:
-        return "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
-
-    client = Groq(api_key=GROQ_API_KEY)
-
-    history = _conversation_history.get(psid, [])
-    history.append({"role": "user", "content": user_followup})
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-
-    try:
-        chat = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=400,
-            temperature=0.4,
-        )
-        reply = chat.choices[0].message.content.strip()
-        history.append({"role": "assistant", "content": reply})
-        _conversation_history[psid] = history
-        return reply
-    except Exception as e:
-        return f"⚠️ LLM error: {str(e)}"
+    """Continue the multi-turn conversation for this user's current question."""
+    return _chat(psid, user_followup)
 
 
 def answer_general(psid: str, user_message: str) -> str:
-    """
-    Answer a general AWS question (no active question context).
-    Also maintains conversation history for back-and-forth.
-    """
-    if not GROQ_API_KEY:
-        return "⚠️ LLM not configured. Please set the GROQ_API_KEY environment variable."
-
-    client = Groq(api_key=GROQ_API_KEY)
-
-    history = _conversation_history.get(psid, [])
-    history.append({"role": "user", "content": user_message})
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
-
-    try:
-        chat = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=400,
-            temperature=0.4,
-        )
-        reply = chat.choices[0].message.content.strip()
-        history.append({"role": "assistant", "content": reply})
-        _conversation_history[psid] = history
-        return reply
-    except Exception as e:
-        return f"⚠️ LLM error: {str(e)}"
+    """Answer a general AWS question (no active question context)."""
+    return _chat(psid, user_message)

@@ -13,6 +13,7 @@ import logging
 import os
 import random
 import threading
+from datetime import date
 
 from flask import Flask, request, jsonify, abort
 
@@ -58,11 +59,16 @@ def startup():
 
 # ── Core logic ────────────────────────────────────────────────────────────────
 
+# Tag for daily-question sends. Outside the 24h user-message window, Facebook
+# requires a message tag. NON_PROMOTIONAL_SUBSCRIPTION is the right one for
+# recurring content (daily quiz) the user opted into by messaging the bot.
+DAILY_TAG = "NON_PROMOTIONAL_SUBSCRIPTION"
+
+
 def _pick_next_question(psid: str):
     """Pick a question the user hasn't answered yet (random order)."""
     questions = load_questions()
     answered = db.get_answered_questions(psid)
-    # Only include well-formed questions (at least 2 options)
     remaining = [q for q in questions if q.number not in answered and len(q.options) >= 2]
     log.info("[pick_question] psid=%s total=%d answered=%d remaining=%d",
              psid, len(questions), len(answered), len(remaining))
@@ -72,40 +78,43 @@ def _pick_next_question(psid: str):
 
 
 def _send_daily_question_to_all_users():
-    """Send the daily question to every known user. Returns a result dict."""
-    log.info("[cron] Starting daily send. DATABASE_URL set: %s", bool(db.DATABASE_URL))
+    """Send the daily question to every user who hasn't already received one today."""
+    today_iso = date.today().isoformat()
+    log.info("[cron] Starting daily send. today=%s DATABASE_URL set: %s",
+             today_iso, bool(db.DATABASE_URL))
 
-    psids = []
+    # Idempotency: only send to users who haven't been sent today's question.
     try:
-        with db._get_conn() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT psid FROM user_state")
-            psids = [row[0] for row in cur.fetchall()]
-        log.info("[cron] Found %d user(s) in user_state: %s", len(psids), psids)
+        psids = db.get_users_due_for_question(today_iso)
+        log.info("[cron] %d user(s) due for today's question", len(psids))
     except Exception as e:
         log.error("[cron] DB error fetching users: %s", e, exc_info=True)
         return {"psids_found": 0, "db_error": str(e)}
 
     if not psids:
-        log.warning("[cron] No users found — nobody will receive a question. "
-                    "Make sure at least one person has sent 'hi' to the bot.")
+        log.warning("[cron] No users due — either nobody is registered or "
+                    "today's send already happened for everyone.")
 
     errors = []
+    sent = 0
     for psid in psids:
         try:
             log.info("[cron] Sending question to psid=%s", psid)
             _send_daily_question(psid)
+            db.mark_question_sent(psid, today_iso)
+            sent += 1
             log.info("[cron] Successfully sent to psid=%s", psid)
         except Exception as e:
             log.error("[cron] Failed to send to psid=%s: %s", psid, e, exc_info=True)
             errors.append({"psid": psid, "error": str(e)})
 
-    log.info("[cron] Done. sent=%d errors=%d", len(psids) - len(errors), len(errors))
-    return {"psids_found": len(psids), "sent": len(psids) - len(errors), "errors": errors}
+    log.info("[cron] Done. sent=%d errors=%d", sent, len(errors))
+    return {"psids_found": len(psids), "sent": sent, "errors": errors}
 
 
 def _send_daily_question(psid: str):
-    """Send a new question to one user."""
+    """Send a new question to one user. Uses the NON_PROMOTIONAL_SUBSCRIPTION
+    tag so Facebook allows the message outside the 24h response window."""
     q = _pick_next_question(psid)
     if q is None:
         log.info("[send_question] psid=%s has answered all questions", psid)
@@ -118,15 +127,15 @@ def _send_daily_question(psid: str):
         return
 
     log.info("[send_question] psid=%s sending question=%d", psid, q.number)
-    llm.clear_history(psid)  # Clear any previous question's conversation
+    llm.clear_history(psid)
     db.upsert_user_state(psid, current_q=q.number, state="awaiting_answer")
 
     question_msg = format_question_message(q)
     if q.options:
         letters = sorted(q.options.keys())
-        msg.send_quick_replies(psid, question_msg, letters)
+        msg.send_quick_replies(psid, question_msg, letters, tag=DAILY_TAG)
     else:
-        msg.send_message(psid, question_msg)
+        msg.send_message(psid, question_msg, tag=DAILY_TAG)
 
 
 def _handle_answer(psid: str, user_text: str, current_q_num: int):
@@ -150,10 +159,15 @@ def _handle_answer(psid: str, user_text: str, current_q_num: int):
     db.record_answer(psid, q.number, answer_letter, bool(is_correct))
     db.upsert_user_state(psid, current_q=q.number, state="answered")
 
+    # Streak: increment if consecutive-day, reset on gap.
+    new_streak = db.update_streak_on_answer(psid, date.today().isoformat())
+    log.info("[answer] psid=%s new streak=%d", psid, new_streak)
+
     result_msg = format_result_message(q, answer_letter)
+    if new_streak > 1:
+        result_msg += f"\n🔥 Current streak: {new_streak} day(s)."
     msg.send_message(psid, result_msg)
 
-    # Seed LLM conversation history so follow-ups have full question context
     llm.start_question_context(
         psid=psid,
         question_text=q.text,
@@ -189,12 +203,15 @@ def _handle_message(psid: str, message_text: str):
     if text_lower in ("stats", "score", "how am i doing"):
         stats = db.get_stats(psid)
         log.info("[message] psid=%s stats: %s", psid, stats)
+        streak = stats.get("streak", 0)
+        streak_line = f"🔥 Current streak: {streak} day(s)\n" if streak else ""
         msg.send_message(
             psid,
             f"📊 Your stats:\n"
             f"  Questions answered: {stats['total']}\n"
             f"  Correct: {stats['correct']}\n"
-            f"  Score: {stats['percentage']}%\n\n"
+            f"  Score: {stats['percentage']}%\n"
+            f"{streak_line}\n"
             f"Type 'next' to get a new question anytime!",
         )
         return
@@ -211,6 +228,20 @@ def _handle_message(psid: str, message_text: str):
 
     if text_lower in ("next", "new question", "another", "skip"):
         log.info("[message] psid=%s requesting next question", psid)
+        # If today's question is still unanswered, gently nudge the user back to it
+        # instead of replacing it with a new one — unless they explicitly say 'skip'.
+        if text_lower != "skip":
+            state = db.get_user_state(psid)
+            today_iso = date.today().isoformat()
+            if state.get("last_sent_date") == today_iso and state.get("current_q"):
+                answered_today = db.has_answered_today(psid)
+                if not answered_today:
+                    msg.send_message(
+                        psid,
+                        f"You still have today's question pending (Q{state['current_q']}). "
+                        f"Reply with A/B/C/D to answer it, or type 'skip' to move on.",
+                    )
+                    return
         _send_daily_question(psid)
         return
 
@@ -224,7 +255,8 @@ def _handle_message(psid: str, message_text: str):
             "🤔 Ask any follow-up question and I'll explain using AI.\n\n"
             "Commands:\n"
             "  next  – Get a question now\n"
-            "  stats – See your score\n"
+            "  skip  – Skip to the next one\n"
+            "  stats – See your score & streak\n"
             "  reset – Reset current question\n"
             "  help  – Show this message",
         )
@@ -293,7 +325,14 @@ def receive_message():
                         _handle_message(psid, text)
                     except Exception as e:
                         log.error("[webhook] Error handling message from psid=%s: %s", psid, e, exc_info=True)
-                        msg.send_message(psid, "⚠️ Something went wrong. Please try again.")
+                        # Never let a fallback send raise — Facebook expects a 200,
+                        # and if our error message itself fails (e.g. token rotation,
+                        # network blip) we'd 500 the webhook and Facebook may disable it.
+                        try:
+                            msg.send_message(psid, "⚠️ Something went wrong. Please try again.")
+                        except Exception as send_err:
+                            log.error("[webhook] Failed to send error message to psid=%s: %s",
+                                      psid, send_err)
 
             elif "postback" in event:
                 payload = event["postback"].get("payload", "")

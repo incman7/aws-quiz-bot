@@ -1,6 +1,15 @@
 """
 messenger.py
 Thin wrapper around the Facebook Messenger Send API.
+
+Supports two messaging types:
+  - "RESPONSE" (default) — used within 24h of the user's last message.
+  - "MESSAGE_TAG" with a tag — used outside the 24h window. The valid tags
+    for our use case are:
+      * "NON_PROMOTIONAL_SUBSCRIPTION" — for recurring content the user
+        opted into (daily quiz reminders). This is what the daily cron
+        uses; without it, Facebook rejects the send once 24h pass since
+        the user's last message.
 """
 
 import os
@@ -10,10 +19,30 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 GRAPH_API_URL = "https://graph.facebook.com/v19.0/me/messages"
 
 
-def send_message(recipient_psid: str, text: str) -> dict:
+def _post(payload: dict) -> dict:
+    """POST a payload to the Send API. Raises on non-2xx."""
+    resp = requests.post(
+        GRAPH_API_URL,
+        params={"access_token": PAGE_ACCESS_TOKEN},
+        json=payload,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_message(
+    recipient_psid: str,
+    text: str,
+    tag: str | None = None,
+) -> dict:
     """
     Send a plain-text message to a Messenger user.
     Facebook messages are limited to 2000 characters; we split if needed.
+
+    If `tag` is provided, the message is sent with
+    messaging_type=MESSAGE_TAG (works outside the 24h window).
+    Otherwise messaging_type=RESPONSE is used (24h window only).
     """
     if not PAGE_ACCESS_TOKEN:
         raise RuntimeError("PAGE_ACCESS_TOKEN is not set.")
@@ -24,23 +53,26 @@ def send_message(recipient_psid: str, text: str) -> dict:
         payload = {
             "recipient": {"id": recipient_psid},
             "message": {"text": chunk},
-            "messaging_type": "RESPONSE",
+            "messaging_type": "MESSAGE_TAG" if tag else "RESPONSE",
         }
-        resp = requests.post(
-            GRAPH_API_URL,
-            params={"access_token": PAGE_ACCESS_TOKEN},
-            json=payload,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        results.append(resp.json())
+        if tag:
+            payload["tag"] = tag
+        results.append(_post(payload))
     return results[-1] if results else {}
 
 
-def send_quick_replies(recipient_psid: str, text: str, replies: list[str]) -> dict:
+def send_quick_replies(
+    recipient_psid: str,
+    text: str,
+    replies: list[str],
+    tag: str | None = None,
+) -> dict:
     """
     Send a message with quick-reply buttons (e.g. A / B / C / D).
     Maximum 13 quick replies allowed by Facebook.
+
+    Pass `tag="NON_PROMOTIONAL_SUBSCRIPTION"` for daily quiz sends so
+    Facebook allows the message outside the 24h window.
     """
     quick_reply_objects = [
         {"content_type": "text", "title": r, "payload": r}
@@ -52,16 +84,11 @@ def send_quick_replies(recipient_psid: str, text: str, replies: list[str]) -> di
             "text": text[:1900],
             "quick_replies": quick_reply_objects,
         },
-        "messaging_type": "RESPONSE",
+        "messaging_type": "MESSAGE_TAG" if tag else "RESPONSE",
     }
-    resp = requests.post(
-        GRAPH_API_URL,
-        params={"access_token": PAGE_ACCESS_TOKEN},
-        json=payload,
-        timeout=10,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    if tag:
+        payload["tag"] = tag
+    return _post(payload)
 
 
 def send_typing_on(recipient_psid: str):
