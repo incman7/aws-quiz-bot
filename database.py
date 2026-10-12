@@ -96,6 +96,8 @@ def init_db():
         # Streak: consecutive days the user answered
         _add_column_if_missing(cur, "user_state", "streak_count", "INTEGER DEFAULT 0")
         _add_column_if_missing(cur, "user_state", "last_answered_date", "TEXT")
+        # Opt-in flag — required for NON_PROMOTIONAL_SUBSCRIPTION tag.
+        _add_column_if_missing(cur, "user_state", "subscribed", "INTEGER DEFAULT 0")
 
         # Per-user persistent LLM conversation history so follow-ups survive
         # serverless cold starts.
@@ -140,7 +142,7 @@ def get_user_state(psid: str) -> dict:
         cur = conn.cursor()
         cur.execute(
             f"SELECT psid, current_q, state, last_active, last_sent_date, "
-            f"streak_count, last_answered_date FROM user_state WHERE psid = {PLACEHOLDER}",
+            f"streak_count, last_answered_date, subscribed FROM user_state WHERE psid = {PLACEHOLDER}",
             (psid,),
         )
         row = cur.fetchone()
@@ -153,6 +155,7 @@ def get_user_state(psid: str) -> dict:
                 "last_sent_date": None,
                 "streak_count": 0,
                 "last_answered_date": None,
+                "subscribed": False,
             }
         if DATABASE_URL:
             cols = [desc[0] for desc in cur.description]
@@ -339,17 +342,68 @@ def has_answered_today(psid: str) -> bool:
 
 def get_users_due_for_question(today_iso: str) -> list[str]:
     """
-    Return PSIDs of every registered user who has not been sent a question
+    Return PSIDs of every opted-in user who has not been sent a question
     on `today_iso` yet. Used by the cron to make the daily send a no-op on
-    duplicate firings.
+    duplicate firings and to skip non-subscribed users (NON_PROMOTIONAL_
+    SUBSCRIPTION tag requires explicit opt-in).
     """
     with _get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
-            f"SELECT psid FROM user_state WHERE last_sent_date IS NULL OR last_sent_date != {PLACEHOLDER}",
+            f"SELECT psid FROM user_state "
+            f"WHERE subscribed = 1 AND (last_sent_date IS NULL OR last_sent_date != {PLACEHOLDER})",
             (today_iso,),
         )
         return [row[0] for row in cur.fetchall()]
+
+
+def set_subscribed(psid: str, subscribed: bool):
+    """Mark a user as opted-in (or out) for daily subscription sends."""
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        if DATABASE_URL:
+            cur.execute(
+                f"""
+                INSERT INTO user_state (psid, current_q, state, last_active, subscribed)
+                VALUES ({PLACEHOLDER}, NULL, 'idle', {PLACEHOLDER}, {PLACEHOLDER})
+                ON CONFLICT (psid) DO UPDATE SET
+                    last_active = EXCLUDED.last_active,
+                    subscribed = EXCLUDED.subscribed
+                """,
+                (psid, datetime.utcnow().isoformat(), 1 if subscribed else 0),
+            )
+        else:
+            cur.execute(
+                f"""
+                INSERT INTO user_state (psid, current_q, state, last_active, subscribed)
+                VALUES ({PLACEHOLDER}, NULL, 'idle', {PLACEHOLDER}, {PLACEHOLDER})
+                ON CONFLICT(psid) DO UPDATE SET
+                    last_active = excluded.last_active,
+                    subscribed = excluded.subscribed
+                """,
+                (psid, datetime.utcnow().isoformat(), 1 if subscribed else 0),
+            )
+
+
+def list_users_for_debug() -> list[dict]:
+    """Return all users with their state, for the /api/debug/users endpoint."""
+    with _get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT psid, current_q, state, last_active, last_sent_date, "
+            "streak_count, last_answered_date, subscribed FROM user_state"
+        )
+        rows = cur.fetchall()
+    out = []
+    for row in rows:
+        if DATABASE_URL:
+            cols = [d[0] for d in cur.description]
+            d = dict(zip(cols, row))
+        else:
+            d = dict(row)
+        d["subscribed"] = bool(d.get("subscribed"))
+        out.append(d)
+    return out
 
 
 # ── Persistent LLM history ────────────────────────────────────────────────────

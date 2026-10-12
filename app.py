@@ -61,8 +61,30 @@ def startup():
 
 # Tag for daily-question sends. Outside the 24h user-message window, Facebook
 # requires a message tag. NON_PROMOTIONAL_SUBSCRIPTION is the right one for
-# recurring content (daily quiz) the user opted into by messaging the bot.
+# recurring content (daily quiz) — REQUIRES the user to have explicitly
+# opted in via the bot (we do that with a Subscribe quick-reply button in the
+# welcome message). Sending without opt-in causes Facebook to silently
+# reject the message with a "user has not subscribed" error.
 DAILY_TAG = "NON_PROMOTIONAL_SUBSCRIPTION"
+
+
+def _extract_fb_error(e: Exception) -> str:
+    """Best-effort extraction of Facebook's error message from a request exception."""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            body = resp.json()
+            err = body.get("error", {})
+            sub = err.get("error_subcode")
+            msg = err.get("message") or str(e)
+            code = resp.status_code
+            return f"HTTP {code} (subcode={sub}): {msg}"
+        except Exception:
+            try:
+                return f"HTTP {resp.status_code}: {resp.text[:200]}"
+            except Exception:
+                pass
+    return str(e)
 
 
 def _pick_next_question(psid: str):
@@ -78,22 +100,30 @@ def _pick_next_question(psid: str):
 
 
 def _send_daily_question_to_all_users():
-    """Send the daily question to every user who hasn't already received one today."""
+    """Send the daily question to every opted-in user who hasn't already received one today."""
     today_iso = date.today().isoformat()
     log.info("[cron] Starting daily send. today=%s DATABASE_URL set: %s",
              today_iso, bool(db.DATABASE_URL))
 
-    # Idempotency: only send to users who haven't been sent today's question.
+    # Idempotency + opt-in filter: only send to subscribed users who haven't
+    # been sent today's question yet.
     try:
         psids = db.get_users_due_for_question(today_iso)
-        log.info("[cron] %d user(s) due for today's question", len(psids))
+        log.info("[cron] %d user(s) due for today's question (subscribed & not yet sent)", len(psids))
     except Exception as e:
         log.error("[cron] DB error fetching users: %s", e, exc_info=True)
         return {"psids_found": 0, "db_error": str(e)}
 
     if not psids:
-        log.warning("[cron] No users due — either nobody is registered or "
-                    "today's send already happened for everyone.")
+        # Distinguish "no subscribers" from "everyone already got today" by
+        # checking the full table.
+        try:
+            total = len(db.list_users_for_debug())
+            subscribed = sum(1 for u in db.list_users_for_debug() if u.get("subscribed"))
+            log.warning("[cron] Nothing to send. total_users=%d subscribed=%d",
+                        total, subscribed)
+        except Exception:
+            pass
 
     errors = []
     sent = 0
@@ -105,8 +135,9 @@ def _send_daily_question_to_all_users():
             sent += 1
             log.info("[cron] Successfully sent to psid=%s", psid)
         except Exception as e:
-            log.error("[cron] Failed to send to psid=%s: %s", psid, e, exc_info=True)
-            errors.append({"psid": psid, "error": str(e)})
+            detail = _extract_fb_error(e)
+            log.error("[cron] Failed to send to psid=%s: %s", psid, detail, exc_info=True)
+            errors.append({"psid": psid, "error": detail})
 
     log.info("[cron] Done. sent=%d errors=%d", sent, len(errors))
     return {"psids_found": len(psids), "sent": sent, "errors": errors}
@@ -245,20 +276,46 @@ def _handle_message(psid: str, message_text: str):
         _send_daily_question(psid)
         return
 
-    if text_lower in ("help", "start", "hi", "hello"):
-        log.info("[message] psid=%s sent greeting — registering user", psid)
+    if text_lower in ("subscribe", "daily", "yes", "enable"):
+        log.info("[message] psid=%s opted in to daily reminders", psid)
+        db.set_subscribed(psid, True)
         msg.send_message(
             psid,
+            "✅ Subscribed! You'll get one quiz question every day at 9am AWST.\n\n"
+            "💬 Reply with A / B / C / D to answer.\n"
+            "🤔 Ask a follow-up question anytime for an AI explanation.\n\n"
+            "Reply 'unsubscribe' to stop daily reminders.",
+        )
+        return
+
+    if text_lower in ("unsubscribe", "stop", "off", "cancel"):
+        log.info("[message] psid=%s opted out of daily reminders", psid)
+        db.set_subscribed(psid, False)
+        msg.send_message(
+            psid,
+            "🔕 Unsubscribed. You won't get daily reminders anymore.\n\n"
+            "You can still type 'next' for a question anytime.\n"
+            "Reply 'subscribe' to opt back in.",
+        )
+        return
+
+    if text_lower in ("help", "start", "hi", "hello"):
+        log.info("[message] psid=%s sent greeting — registering user", psid)
+        # Welcome message includes a Subscribe button so the user can opt in
+        # in one tap. Without opt-in, Facebook rejects our daily sends.
+        msg.send_quick_replies(
+            psid,
             "👋 Welcome to AWS SAA-C03 Daily Quiz Bot!\n\n"
-            "📅 You'll receive one question each day at 9am AWST.\n"
+            "📅 Tap *Subscribe* to receive one question every day at 9am AWST.\n"
             "💬 Reply with A / B / C / D to answer.\n"
             "🤔 Ask any follow-up question and I'll explain using AI.\n\n"
             "Commands:\n"
             "  next  – Get a question now\n"
             "  skip  – Skip to the next one\n"
             "  stats – See your score & streak\n"
-            "  reset – Reset current question\n"
+            "  unsubscribe – Stop daily reminders\n"
             "  help  – Show this message",
+            ["Subscribe", "Help"],
         )
         db.upsert_user_state(psid, state="idle")
         log.info("[message] psid=%s registered in user_state", psid)
@@ -374,13 +431,93 @@ def trigger_daily():
 @app.route("/api/status", methods=["GET"])
 def status():
     questions = load_questions()
-    log.info("[status] Health check — questions=%d db=%s", len(questions), bool(db.DATABASE_URL))
+    users = []
+    try:
+        users = db.list_users_for_debug()
+    except Exception as e:
+        log.error("[status] Could not list users: %s", e)
+    subscribed = sum(1 for u in users if u.get("subscribed"))
+    db_type = "postgres" if db.DATABASE_URL else "sqlite"
+    log.info("[status] Health check — questions=%d users=%d subscribed=%d db=%s",
+             len(questions), len(users), subscribed, db_type)
     return jsonify({
         "status": "running",
         "questions_loaded": len(questions),
         "llm_model": llm.MODEL,
-        "database_url_set": bool(db.DATABASE_URL),
+        "database_type": db_type,
+        "users_total": len(users),
+        "users_subscribed": subscribed,
     })
+
+
+@app.route("/api/debug/users", methods=["GET"])
+def debug_users():
+    """List all users — masked PSIDs + state. For diagnostics when logs aren't available."""
+    try:
+        users = db.list_users_for_debug()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    masked = []
+    for u in users:
+        psid = u.get("psid", "")
+        masked.append({
+            "psid_masked": psid[:4] + "…" + psid[-2:] if len(psid) > 6 else psid,
+            "psid": psid,
+            "current_q": u.get("current_q"),
+            "state": u.get("state"),
+            "subscribed": bool(u.get("subscribed")),
+            "streak": u.get("streak_count"),
+            "last_sent_date": u.get("last_sent_date"),
+            "last_answered_date": u.get("last_answered_date"),
+            "last_active": u.get("last_active"),
+        })
+    return jsonify({"today": date.today().isoformat(), "users": masked})
+
+
+@app.route("/api/debug/state", methods=["GET"])
+def debug_state():
+    """Return full state for one PSID. ?psid=... (required)."""
+    psid = request.args.get("psid", "").strip()
+    if not psid:
+        return jsonify({"error": "psid query param required"}), 400
+    state = db.get_user_state(psid)
+    answered = sorted(db.get_answered_questions(psid))
+    return jsonify({
+        "psid": psid,
+        "state": state,
+        "answered_count": len(answered),
+        "answered_sample": answered[:10],
+    })
+
+
+@app.route("/api/debug/trigger-send", methods=["GET", "POST"])
+def debug_trigger_send():
+    """
+    Manually trigger the daily-send flow for one (or all) users.
+    Bypasses the CRON_SECRET check (use only for diagnostics).
+    ?psid=... optional — if omitted, sends to all due users.
+    Returns the full result including per-user Facebook error details.
+    """
+    psid = request.args.get("psid", "").strip()
+    today_iso = date.today().isoformat()
+
+    if psid:
+        # Single-user send: bypass idempotency so you can re-test.
+        log.info("[debug] Manual trigger for psid=%s", psid)
+        try:
+            _send_daily_question(psid)
+            db.mark_question_sent(psid, today_iso)
+            return jsonify({"status": "ok", "psid": psid, "sent": True})
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "psid": psid,
+                "error": _extract_fb_error(e),
+            }), 500
+
+    # No psid: do the full cron flow (idempotent).
+    result = _send_daily_question_to_all_users()
+    return jsonify({"status": "ok", "today": today_iso, "result": result})
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
